@@ -1,12 +1,13 @@
 # Shape Generation and Completion Through Point-Voxel Diffusion
+<p float="left">
+  <img src="assets/pvd_teaser.gif" width="80%"/>
+</p>
 
-[Project]() | [Paper]() 
+[Project](https://alexzhou907.github.io/pvd) | [Paper](https://arxiv.org/abs/2104.03670) 
 
-Implementation of 
+Implementation of Shape Generation and Completion Through Point-Voxel Diffusion
 
-## Pretrained Models
-
-Pretrained models can be accessed [here](https://www.dropbox.com/s/a3xydf594fzaokl/cifar10_pretrained.rar?dl=0).
+[Linqi Zhou](https://alexzhou907.github.io), [Yilun Du](https://yilundu.github.io/), [Jiajun Wu](https://jiajunwu.com/)
 
 ## Requirements:
 
@@ -20,24 +21,56 @@ cudatoolkit==10.1
 matplotlib==2.2.5
 tqdm==4.32.1
 open3d==0.9.0
+trimesh=3.7.12
+scipy==1.5.1
 ```
+
+Install PyTorchEMD by
+```
+cd metrics/PyTorchEMD
+python setup.py install
+cp build/**/emd_cuda.cpython-36m-x86_64-linux-gnu.so .
+```
+
 The code was tested on Unbuntu with Titan RTX. 
 
+## Data
 
-## Training on CIFAR-10:
+For generation, we use ShapeNet point cloud, which can be downloaded [here](https://github.com/stevenygd/PointFlow).
+
+For completion, we use ShapeNet rendering provided by [GenRe](https://github.com/xiumingzhang/GenRe-ShapeHD).
+We provide script `convert_cam_params.py` to process the provided data.
+
+For training the model on shape completion, we need camera parameters for each view
+which are not directly available. To obtain these, simply run 
+```bash
+$ python convert_cam_params.py --dataroot DATA_DIR --mitsuba_xml_root XML_DIR
+```
+which will create `..._cam_params.npz` in each provided data folder for each view.
+
+## Pretrained models
+Pretrained models can be downloaded [here](https://drive.google.com/drive/folders/1Q7aSaTr6lqmo8qx80nIm1j28mOHAHGiM?usp=sharing).
+
+## Training:
 
 ```bash
-$ python train_cifar.py
+$ python train_generation.py --category car|chair|airplane
 ```
 
 Please refer to the python file for optimal training parameters.
+
+## Testing:
+
+```bash
+$ python train_generation.py --category car|chair|airplane --model MODEL_PATH
+```
 
 ## Results
 
 Some generative results are as follows.
 <p float="left">
-  <img src="example/cifar_gen.png" width="300"/>
-  <img src="example/lsun_gen.png" width="300"/>
+  <img src="assets/cifar_gen.png" width="300"/>
+  <img src="assets/lsun_gen.png" width="300"/>
 </p>
 
 

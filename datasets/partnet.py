@@ -5,9 +5,7 @@ import os
 import json
 import random
 import trimesh
-import csv
 from plyfile import PlyData, PlyElement
-from glob import glob
 
 def project_pc_to_image(points, resolution=64):
     """project point clouds into 2D image
@@ -181,33 +179,3 @@ class GANdatasetPartNet(Dataset):
 
 
 
-
-if __name__ == '__main__':
-    data_root = '/viscam/u/alexzhou907/01DATA/shapenet/ShapeNetPointCloud'
-    data_raw_root = '/viscam/u/alexzhou907/01DATA/shapenet/shapenet_dim32_sdf_pc'
-    pc_dataroot = '/viscam/u/alexzhou907/01DATA/shapenet/ShapeNetCore.v2.PC15k'
-
-    sn_root = '/viscam/u/alexzhou907/01DATA/shapenet/ShapeNetCore.v2'
-    classes = 'car'
-    npoints = 2048
-    # from datasets.shapenet_data_pc import ShapeNet15kPointClouds
-    # pc_ds = ShapeNet15kPointClouds(root_dir=pc_dataroot,
-    #                                categories=[classes], split='train',
-    #                                tr_sample_size=npoints,
-    #                                te_sample_size=npoints,
-    #                                scale=1.,
-    #                                normalize_per_shape=False,
-    #                                normalize_std_per_axis=False,
-    #                                random_subsample=True)
-
-    train_ds = GANdatasetPartNet('test', pc_dataroot, data_raw_root, classes, npoints, np.array([0,0,0]),
-                               np.array([1, 1, 1]))
-
-    d1 = train_ds[0]
-    real = d1['real']
-    raw = d1['raw']
-    m, s = d1['m'], d1['s']
-    x = (torch.cat([raw, real], dim=-1) * s + m).transpose(0,1)
-
-    write_ply(x.numpy(), 'x.ply')
-    pass
