@@ -67,26 +67,41 @@ $ python train_generation.py --category car|chair|airplane --model MODEL_PATH
 
 ## Results
 
-Some generative results are as follows.
+Some generation and completion results are as follows.
 <p float="left">
-  <img src="assets/cifar_gen.png" width="300"/>
-  <img src="assets/lsun_gen.png" width="300"/>
+  <img src="assets/gen_comp.gif" width="60%"/>
+</p>
+
+Multimodal completion on ShapeNet chair.
+<p float="left">
+  <img src="assets/mm_shapenet.gif" width="80%"/>
 </p>
 
 
+Multimodal completion on PartNet.
+<p float="left">
+  <img src="assets/mm_partnet.gif" width="80%"/>
+</p>
+
+
+Multimodal completion on RedWood 3DScan Chairs.
+<p float="left">
+  <img src="assets/mm_redwood.gif" width="80%"/>
+</p>
 
 ## Reference
 
 ```
-@inproceedings{han2020joint,
-  title={Joint Training of Variational Auto-Encoder and Latent Energy-Based Model},
-  author={Han, Tian and Nijkamp, Erik and Zhou, Linqi and Pang, Bo and Zhu, Song-Chun and Wu, Ying Nian},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  pages={7978--7987},
-  year={2020}
+@inproceedings{Zhou_2021_ICCV,
+    author    = {Zhou, Linqi and Du, Yilun and Wu, Jiajun},
+    title     = {3D Shape Generation and Completion Through Point-Voxel Diffusion},
+    booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+    month     = {October},
+    year      = {2021},
+    pages     = {5826-5835}
 }
 ```
 
 ## Acknowledgement
 
-For any questions related to codes and experiment setting, please contact Linqi (Alex) Zhou (alexzhou907@gmail.com). For questions related to model and algorithm in the paper, please contact Tian Han (hantian@ucla.edu). Thanks to [@Tian Han ](https://github.com/hthth0801?tab=repositories) and [@Erik Njikamp](https://github.com/enijkamp) for their colloboration and guidance.
+For any questions related to codes and experiment setting, please contact [Linqi Zhou](linqizhou@stanford.edu) and [Yilun Du](yilundu@mit.edu). 
