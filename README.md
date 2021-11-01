@@ -1,7 +1,7 @@
 # Shape Generation and Completion Through Point-Voxel Diffusion
-<p float="center">
+<center>
   <img src="assets/pvd_teaser.gif" width="80%"/>
-</p>
+</center>
 
 [Project](https://alexzhou907.github.io/pvd) | [Paper](https://arxiv.org/abs/2104.03670) 
 
@@ -68,26 +68,26 @@ $ python train_generation.py --category car|chair|airplane --model MODEL_PATH
 ## Results
 
 Some generation and completion results are as follows.
-<p float="center">
+<center>
   <img src="assets/gen_comp.gif" width="60%"/>
-</p>
+</center>
 
 Multimodal completion on ShapeNet chair.
-<p float="center">
+<center>
   <img src="assets/mm_shapenet.gif" width="80%"/>
-</p>
+</center>
 
 
 Multimodal completion on PartNet.
-<p float="center">
+<center>
   <img src="assets/mm_partnet.gif" width="80%"/>
-</p>
+</center>
 
 
 Multimodal completion on RedWood 3DScan Chairs.
-<p float="center">
+<center>
   <img src="assets/mm_redwood.gif" width="80%"/>
-</p>
+</center>
 
 ## Reference
 
