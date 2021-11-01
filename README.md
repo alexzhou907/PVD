@@ -79,13 +79,13 @@ Multimodal completion on a ShapeNet chair.
 
 
 Multimodal completion on PartNet.
-<<p align="center">>
+<p align="center">
   <img src="assets/mm_partnet.gif" width="80%"/>
 </p>
 
 
 Multimodal completion on two Redwood 3DScan chairs.
-<<p align="center">>
+<p align="center">
   <img src="assets/mm_redwood.gif" width="80%"/>
 </p>
 
