@@ -62,7 +62,7 @@ Please refer to the python file for optimal training parameters.
 ## Testing:
 
 ```bash
-$ python train_generation.py --category car|chair|airplane --model MODEL_PATH
+$ python test_generation.py --category car|chair|airplane --model MODEL_PATH
 ```
 
 ## Results
