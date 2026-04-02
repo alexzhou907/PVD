@@ -10,12 +10,13 @@
 #include <vector>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAApplyUtils.cuh>  // at::cuda::getApplyGrid
-#include <THC/THC.h>
+#include <cuda_runtime.h>
 
-#define CHECK_CUDA(x) TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_EQ(x, y) TORCH_CHECK((x) == (y), #x " must equal " #y)
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+#define CUDA_CHECK(err) TORCH_CHECK((err) == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err))
 
 
 /********************************
@@ -185,9 +186,9 @@ at::Tensor ApproxMatchForward(
   auto temp = at::zeros({b, (n+m)*2}, xyz1.type());
 
   AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "ApproxMatchForward", ([&] {
-        approxmatch<scalar_t><<<32,512>>>(b, n, m, xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), temp.data<scalar_t>());
+        approxmatch<scalar_t><<<32,512>>>(b, n, m, xyz1.data_ptr<scalar_t>(), xyz2.data_ptr<scalar_t>(), match.data_ptr<scalar_t>(), temp.data_ptr<scalar_t>());
   }));
-  THCudaCheck(cudaGetLastError());
+  CUDA_CHECK(cudaGetLastError());
 
   return match;
 }
@@ -271,9 +272,9 @@ at::Tensor MatchCostForward(
   auto cost = at::zeros({b}, xyz1.type());
 
   AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "MatchCostForward", ([&] {
-        matchcost<scalar_t><<<32,512>>>(b, n, m, xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), cost.data<scalar_t>());
+        matchcost<scalar_t><<<32,512>>>(b, n, m, xyz1.data_ptr<scalar_t>(), xyz2.data_ptr<scalar_t>(), match.data_ptr<scalar_t>(), cost.data_ptr<scalar_t>());
   }));
-  THCudaCheck(cudaGetLastError());
+  CUDA_CHECK(cudaGetLastError());
 
   return cost;
 }
@@ -389,10 +390,10 @@ std::vector<at::Tensor> MatchCostBackward(
   auto grad2 = at::zeros({b, m, 3}, xyz1.type());
 
   AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "MatchCostBackward", ([&] {
-        matchcostgrad1<scalar_t><<<32,512>>>(b, n, m, grad_cost.data<scalar_t>(), xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), grad1.data<scalar_t>());
-        matchcostgrad2<scalar_t><<<dim3(32,32),256>>>(b, n, m, grad_cost.data<scalar_t>(), xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), grad2.data<scalar_t>());
+        matchcostgrad1<scalar_t><<<32,512>>>(b, n, m, grad_cost.data_ptr<scalar_t>(), xyz1.data_ptr<scalar_t>(), xyz2.data_ptr<scalar_t>(), match.data_ptr<scalar_t>(), grad1.data_ptr<scalar_t>());
+        matchcostgrad2<scalar_t><<<dim3(32,32),256>>>(b, n, m, grad_cost.data_ptr<scalar_t>(), xyz1.data_ptr<scalar_t>(), xyz2.data_ptr<scalar_t>(), match.data_ptr<scalar_t>(), grad2.data_ptr<scalar_t>());
   }));
-  THCudaCheck(cudaGetLastError());
+  CUDA_CHECK(cudaGetLastError());
 
   return std::vector<at::Tensor>({grad1, grad2});
 }

@@ -1,3 +1,4 @@
+import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -10,7 +11,7 @@ setup(
         ]),
     ],
 
-    extra_cuda_cflags=['--compiler-bindir=/usr/bin/gcc-8'],
+    extra_cuda_cflags=([f"--compiler-bindir={os.environ.get('PVD_NVCC_COMPILER') or os.environ.get('CC')}"] if (os.environ.get('PVD_NVCC_COMPILER') or os.environ.get('CC')) else []),
     cmdclass={
         'build_ext': BuildExtension
     })

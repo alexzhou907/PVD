@@ -9,13 +9,14 @@ if not chamfer_found:
     print("Jitting Chamfer 3D")
 
     from torch.utils.cpp_extension import load
+    host_compiler = os.environ.get('PVD_NVCC_COMPILER') or os.environ.get('CC')
+    extra_cuda_cflags = [f'--compiler-bindir={host_compiler}'] if host_compiler else []
     chamfer_3D = load(name="chamfer_3D",
           sources=[
               "/".join(os.path.abspath(__file__).split('/')[:-1] + ["chamfer_cuda.cpp"]),
               "/".join(os.path.abspath(__file__).split('/')[:-1] + ["chamfer3D.cu"]),
               ],
-
-                      extra_cuda_cflags=['--compiler-bindir=/usr/bin/gcc-8'],)
+          extra_cuda_cflags=extra_cuda_cflags,)
     print("Loaded JIT 3D CUDA chamfer distance")
 
 else:

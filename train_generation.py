@@ -2,15 +2,29 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data
+from torch.utils.data._utils.collate import default_collate
 
 import argparse
+import functools
+import logging
 from torch.distributions import Normal
 
 from utils.file_utils import *
 from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
+from point_cloud_state import (
+    PointCloudState,
+    dense_values_to_flat,
+    dense_to_point_cloud_state,
+    expand_sample_tensor,
+    point_cloud_state_from_points_list,
+    point_cloud_state_to_dense,
+    segment_mean,
+)
 import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+
+DEFAULT_POINTELLIGENCE_RESOLUTIONS = frozenset({8, 16, 32})
 
 '''
 some utils
@@ -50,6 +64,35 @@ def getGradNorm(net):
     pNorm = torch.sqrt(sum(torch.sum(p ** 2) for p in net.parameters()))
     gradNorm = torch.sqrt(sum(torch.sum(p.grad ** 2) for p in net.parameters()))
     return pNorm, gradNorm
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "y", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
+def parse_resolution_set(value):
+    if value is None:
+        return None
+    if isinstance(value, (set, frozenset, tuple, list)):
+        return frozenset(int(item) for item in value)
+    if isinstance(value, int):
+        return frozenset({value})
+    normalized = value.strip()
+    if not normalized:
+        return frozenset()
+    try:
+        return frozenset(int(item.strip()) for item in normalized.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid pvconv_pointelligence_resolutions value: {value}"
+        ) from exc
 
 
 def weights_init(m):
@@ -147,63 +190,88 @@ class GaussianDiffusion:
         assert out.shape == torch.Size([bs])
         return torch.reshape(out, [bs] + ((len(x_shape) - 1) * [1]))
 
+    @staticmethod
+    def _extract_state(a, t, state):
+        sample_values = torch.gather(a, 0, t)
+        return expand_sample_tensor(sample_values[:, None], state.sample_inds)
+
+    @staticmethod
+    def _values(data):
+        if isinstance(data, PointCloudState):
+            return data.coords
+        return data
+
+    def _extract_like(self, a, t, data):
+        if isinstance(data, PointCloudState):
+            return self._extract_state(a.to(data.coords.device), t, data)
+        return self._extract(a.to(data.device), t, data.shape)
+
 
 
     def q_mean_variance(self, x_start, t):
-        mean = self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start
-        variance = self._extract(1. - self.alphas_cumprod.to(x_start.device), t, x_start.shape)
-        log_variance = self._extract(self.log_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape)
+        x_values = self._values(x_start)
+        coeff = self._extract_like(self.sqrt_alphas_cumprod, t, x_start)
+        mean = coeff * x_values
+        variance = self._extract_like(1. - self.alphas_cumprod, t, x_start) * torch.ones_like(x_values)
+        log_variance = self._extract_like(self.log_one_minus_alphas_cumprod, t, x_start) * torch.ones_like(x_values)
         return mean, variance, log_variance
 
     def q_sample(self, x_start, t, noise=None):
         """
         Diffuse the data (t == 0 means diffused for 1 step)
         """
+        x_values = self._values(x_start)
         if noise is None:
-            noise = torch.randn(x_start.shape, device=x_start.device)
-        assert noise.shape == x_start.shape
-        return (
-                self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start +
-                self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape) * noise
+            noise = torch.randn(x_values.shape, device=x_values.device)
+        assert noise.shape == x_values.shape
+        sample = (
+                self._extract_like(self.sqrt_alphas_cumprod, t, x_start) * x_values +
+                self._extract_like(self.sqrt_one_minus_alphas_cumprod, t, x_start) * noise
         )
+        if isinstance(x_start, PointCloudState):
+            return x_start.replace_coords_and_features(sample)
+        return sample
 
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
         Compute the mean and variance of the diffusion posterior q(x_{t-1} | x_t, x_0)
         """
-        assert x_start.shape == x_t.shape
+        x_start_values = self._values(x_start)
+        x_t_values = self._values(x_t)
+        assert x_start_values.shape == x_t_values.shape
         posterior_mean = (
-                self._extract(self.posterior_mean_coef1.to(x_start.device), t, x_t.shape) * x_start +
-                self._extract(self.posterior_mean_coef2.to(x_start.device), t, x_t.shape) * x_t
+                self._extract_like(self.posterior_mean_coef1, t, x_t) * x_start_values +
+                self._extract_like(self.posterior_mean_coef2, t, x_t) * x_t_values
         )
-        posterior_variance = self._extract(self.posterior_variance.to(x_start.device), t, x_t.shape)
-        posterior_log_variance_clipped = self._extract(self.posterior_log_variance_clipped.to(x_start.device), t, x_t.shape)
+        posterior_variance = self._extract_like(self.posterior_variance, t, x_t) * torch.ones_like(x_t_values)
+        posterior_log_variance_clipped = self._extract_like(self.posterior_log_variance_clipped, t, x_t) * torch.ones_like(x_t_values)
         assert (posterior_mean.shape[0] == posterior_variance.shape[0] == posterior_log_variance_clipped.shape[0] ==
-                x_start.shape[0])
+                x_start_values.shape[0])
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
 
     def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool):
-
+        data_values = self._values(data)
         model_output = denoise_fn(data, t)
+        model_output_values = self._values(model_output)
 
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
             # below: only log_variance is used in the KL computations
             model_variance, model_log_variance = {
                 # for fixedlarge, we set the initial (log-)variance like so to get a better decoder log likelihood
-                'fixedlarge': (self.betas.to(data.device),
-                               torch.log(torch.cat([self.posterior_variance[1:2], self.betas[1:]])).to(data.device)),
-                'fixedsmall': (self.posterior_variance.to(data.device), self.posterior_log_variance_clipped.to(data.device)),
+                'fixedlarge': (self.betas.to(data_values.device),
+                               torch.log(torch.cat([self.posterior_variance[1:2], self.betas[1:]])).to(data_values.device)),
+                'fixedsmall': (self.posterior_variance.to(data_values.device), self.posterior_log_variance_clipped.to(data_values.device)),
             }[self.model_var_type]
-            model_variance = self._extract(model_variance, t, data.shape) * torch.ones_like(data)
-            model_log_variance = self._extract(model_log_variance, t, data.shape) * torch.ones_like(data)
+            model_variance = self._extract_like(model_variance, t, data) * torch.ones_like(data_values)
+            model_log_variance = self._extract_like(model_log_variance, t, data) * torch.ones_like(data_values)
         else:
             raise NotImplementedError(self.model_var_type)
 
         if self.model_mean_type == 'eps':
-            x_recon = self._predict_xstart_from_eps(data, t=t, eps=model_output)
+            x_recon = self._predict_xstart_from_eps(data, t=t, eps=model_output_values)
 
             if clip_denoised:
                 x_recon = torch.clamp(x_recon, -.5, .5)
@@ -213,18 +281,19 @@ class GaussianDiffusion:
             raise NotImplementedError(self.loss_type)
 
 
-        assert model_mean.shape == x_recon.shape == data.shape
-        assert model_variance.shape == model_log_variance.shape == data.shape
+        assert model_mean.shape == x_recon.shape == data_values.shape
+        assert model_variance.shape == model_log_variance.shape == data_values.shape
         if return_pred_xstart:
             return model_mean, model_variance, model_log_variance, x_recon
         else:
             return model_mean, model_variance, model_log_variance
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
-        assert x_t.shape == eps.shape
+        x_t_values = self._values(x_t)
+        assert x_t_values.shape == eps.shape
         return (
-                self._extract(self.sqrt_recip_alphas_cumprod.to(x_t.device), t, x_t.shape) * x_t -
-                self._extract(self.sqrt_recipm1_alphas_cumprod.to(x_t.device), t, x_t.shape) * eps
+                self._extract_like(self.sqrt_recip_alphas_cumprod, t, x_t) * x_t_values -
+                self._extract_like(self.sqrt_recipm1_alphas_cumprod, t, x_t) * eps
         )
 
     ''' samples '''
@@ -235,18 +304,25 @@ class GaussianDiffusion:
         """
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
                                                                  return_pred_xstart=True)
-        noise = noise_fn(size=data.shape, dtype=data.dtype, device=data.device)
-        assert noise.shape == data.shape
+        data_values = self._values(data)
+        noise = noise_fn(size=data_values.shape, dtype=data_values.dtype, device=data_values.device)
+        assert noise.shape == data_values.shape
         # no noise when t == 0
-        nonzero_mask = torch.reshape(1 - (t == 0).float(), [data.shape[0]] + [1] * (len(data.shape) - 1))
+        if isinstance(data, PointCloudState):
+            nonzero_mask = expand_sample_tensor((1 - (t == 0).float())[:, None], data.sample_inds)
+        else:
+            nonzero_mask = torch.reshape(1 - (t == 0).float(), [data.shape[0]] + [1] * (len(data.shape) - 1))
 
         sample = model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
         assert sample.shape == pred_xstart.shape
+        if isinstance(data, PointCloudState):
+            sample = data.replace_coords_and_features(sample)
         return (sample, pred_xstart) if return_pred_xstart else sample
 
 
     def p_sample_loop(self, denoise_fn, shape, device,
-                      noise_fn=torch.randn, clip_denoised=True, keep_running=False):
+                      noise_fn=torch.randn, clip_denoised=True, keep_running=False,
+                      state_grid_size=None):
         """
         Generate samples
         keep_running: True if we run 2 x num_timesteps, False if we just run num_timesteps
@@ -254,17 +330,24 @@ class GaussianDiffusion:
         """
 
         assert isinstance(shape, (tuple, list))
-        img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        if state_grid_size is None:
+            raise ValueError("state_grid_size must be provided for state-based sampling")
+        img_t = dense_to_point_cloud_state(
+            noise_fn(size=shape, dtype=torch.float, device=device),
+            grid_size=state_grid_size,
+        )
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
             img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn,
                                   clip_denoised=clip_denoised, return_pred_xstart=False)
 
-        assert img_t.shape == shape
-        return img_t
+        dense_out = point_cloud_state_to_dense(img_t.coords, img_t.sample_sizes)
+        assert dense_out.shape == shape
+        return dense_out
 
     def p_sample_loop_trajectory(self, denoise_fn, shape, device, freq,
-                                 noise_fn=torch.randn,clip_denoised=True, keep_running=False):
+                                 noise_fn=torch.randn,clip_denoised=True, keep_running=False,
+                                 state_grid_size=None):
         """
         Generate samples, returning intermediate images
         Useful for visualizing how denoised images evolve over time
@@ -273,11 +356,16 @@ class GaussianDiffusion:
             is used across the batch. If >= 0, the initial noise is the same for all batch elemements.
         """
         assert isinstance(shape, (tuple, list))
+        if state_grid_size is None:
+            raise ValueError("state_grid_size must be provided for state-based sampling")
 
         total_steps =  self.num_timesteps if not keep_running else len(self.betas)
 
-        img_t = noise_fn(size=shape, dtype=torch.float, device=device)
-        imgs = [img_t]
+        img_t = dense_to_point_cloud_state(
+            noise_fn(size=shape, dtype=torch.float, device=device),
+            grid_size=state_grid_size,
+        )
+        imgs = [point_cloud_state_to_dense(img_t.coords, img_t.sample_sizes)]
         for t in reversed(range(0,total_steps)):
 
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
@@ -285,7 +373,7 @@ class GaussianDiffusion:
                                   clip_denoised=clip_denoised,
                                   return_pred_xstart=False)
             if t % freq == 0 or t == total_steps-1:
-                imgs.append(img_t)
+                imgs.append(point_cloud_state_to_dense(img_t.coords, img_t.sample_sizes))
 
         assert imgs[-1].shape == shape
         return imgs
@@ -297,7 +385,10 @@ class GaussianDiffusion:
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
             denoise_fn, data=data_t, t=t, clip_denoised=clip_denoised, return_pred_xstart=True)
         kl = normal_kl(true_mean, true_log_variance_clipped, model_mean, model_log_variance)
-        kl = kl.mean(dim=list(range(1, len(data_start.shape)))) / np.log(2.)
+        if isinstance(data_start, PointCloudState):
+            kl = segment_mean(kl.mean(dim=1, keepdim=True), data_start.sample_sizes).squeeze(1) / np.log(2.)
+        else:
+            kl = kl.mean(dim=list(range(1, len(data_start.shape)))) / np.log(2.)
 
         return (kl, pred_xstart) if return_pred_xstart else kl
 
@@ -305,6 +396,33 @@ class GaussianDiffusion:
         """
         Training loss calculation
         """
+        if isinstance(data_start, PointCloudState):
+            B = data_start.sample_sizes.numel()
+            assert t.shape == torch.Size([B])
+            data_values = data_start.coords
+
+            if noise is None:
+                noise = torch.randn(data_values.shape, dtype=data_values.dtype, device=data_values.device)
+            assert noise.shape == data_values.shape and noise.dtype == data_values.dtype
+
+            data_t = self.q_sample(x_start=data_start, t=t, noise=noise)
+
+            if self.loss_type == 'mse':
+                eps_recon = denoise_fn(data_t, t)
+                eps_recon_values = self._values(eps_recon)
+                assert data_t.coords.shape == data_values.shape
+                assert eps_recon_values.shape == data_values.shape
+                losses = ((noise - eps_recon_values)**2).mean(dim=1, keepdim=True)
+                losses = segment_mean(losses, data_start.sample_sizes).squeeze(1)
+            elif self.loss_type == 'kl':
+                losses = self._vb_terms_bpd(
+                    denoise_fn=denoise_fn, data_start=data_start, data_t=data_t, t=t, clip_denoised=False,
+                    return_pred_xstart=False)
+            else:
+                raise NotImplementedError(self.loss_type)
+
+            assert losses.shape == torch.Size([B])
+            return losses
         B, D, N = data_start.shape
         assert t.shape == torch.Size([B])
 
@@ -336,6 +454,14 @@ class GaussianDiffusion:
     def _prior_bpd(self, x_start):
 
         with torch.no_grad():
+            if isinstance(x_start, PointCloudState):
+                B, T = x_start.sample_sizes.numel(), self.num_timesteps
+                t_ = torch.empty(B, dtype=torch.int64, device=x_start.coords.device).fill_(T-1)
+                qt_mean, _, qt_log_variance = self.q_mean_variance(x_start, t=t_)
+                kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance,
+                                     mean2=torch.tensor([0.]).to(qt_mean), logvar2=torch.tensor([0.]).to(qt_log_variance))
+                assert kl_prior.shape == x_start.coords.shape
+                return segment_mean(kl_prior.mean(dim=1, keepdim=True), x_start.sample_sizes).squeeze(1) / np.log(2.)
             B, T = x_start.shape[0], self.num_timesteps
             t_ = torch.empty(B, dtype=torch.int64, device=x_start.device).fill_(T-1)
             qt_mean, _, qt_log_variance = self.q_mean_variance(x_start, t=t_)
@@ -347,6 +473,32 @@ class GaussianDiffusion:
     def calc_bpd_loop(self, denoise_fn, x_start, clip_denoised=True):
 
         with torch.no_grad():
+            if isinstance(x_start, PointCloudState):
+                B, T = x_start.sample_sizes.numel(), self.num_timesteps
+
+                vals_bt_, mse_bt_= torch.zeros([B, T], device=x_start.coords.device), torch.zeros([B, T], device=x_start.coords.device)
+                for t in reversed(range(T)):
+
+                    t_b = torch.empty(B, dtype=torch.int64, device=x_start.coords.device).fill_(t)
+                    new_vals_b, pred_xstart = self._vb_terms_bpd(
+                        denoise_fn, data_start=x_start, data_t=self.q_sample(x_start=x_start, t=t_b), t=t_b,
+                        clip_denoised=clip_denoised, return_pred_xstart=True)
+                    assert pred_xstart.shape == x_start.coords.shape
+                    new_mse_b = segment_mean(
+                        ((pred_xstart - x_start.coords)**2).mean(dim=1, keepdim=True),
+                        x_start.sample_sizes,
+                    ).squeeze(1)
+                    assert new_vals_b.shape == new_mse_b.shape ==  torch.Size([B])
+                    mask_bt = t_b[:, None]==torch.arange(T, device=t_b.device)[None, :].float()
+                    vals_bt_ = vals_bt_ * (~mask_bt) + new_vals_b[:, None] * mask_bt
+                    mse_bt_ = mse_bt_ * (~mask_bt) + new_mse_b[:, None] * mask_bt
+                    assert mask_bt.shape == vals_bt_.shape == vals_bt_.shape == torch.Size([B, T])
+
+                prior_bpd_b = self._prior_bpd(x_start)
+                total_bpd_b = vals_bt_.sum(dim=1) + prior_bpd_b
+                assert vals_bt_.shape == mse_bt_.shape == torch.Size([B, T]) and \
+                       total_bpd_b.shape == prior_bpd_b.shape ==  torch.Size([B])
+                return total_bpd_b.mean(), vals_bt_.mean(), prior_bpd_b.mean(), mse_bt_.mean()
             B, T = x_start.shape[0], self.num_timesteps
 
             vals_bt_, mse_bt_= torch.zeros([B, T], device=x_start.device), torch.zeros([B, T], device=x_start.device)
@@ -389,11 +541,15 @@ class PVCNN2(PVCNN2Base):
     ]
 
     def __init__(self, num_classes, embed_dim, use_att,dropout, extra_feature_channels=3, width_multiplier=1,
-                 voxel_resolution_multiplier=1):
+                 voxel_resolution_multiplier=1, pvconv_backend="voxel", pvconv_local_attention=None,
+                 pvconv_pointelligence_resolutions=None):
         super().__init__(
             num_classes=num_classes, embed_dim=embed_dim, use_att=use_att,
             dropout=dropout, extra_feature_channels=extra_feature_channels,
-            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
+            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier,
+            pvconv_backend=pvconv_backend,
+            pvconv_local_attention=pvconv_local_attention,
+            pvconv_pointelligence_resolutions=pvconv_pointelligence_resolutions,
         )
 
 
@@ -401,14 +557,58 @@ class Model(nn.Module):
     def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type:str):
         super(Model, self).__init__()
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
+        if not hasattr(args, "state_grid_size") or args.state_grid_size is None:
+            raise ValueError("args.state_grid_size must be provided for generation state geometry")
+        self.state_grid_size = float(args.state_grid_size)
+        self.pvconv_backend = getattr(args, "pvconv_backend", "voxel")
+        raw_pointelligence_resolutions = getattr(args, "pvconv_pointelligence_resolutions", None)
+        if self.pvconv_backend == "pointelligence":
+            if raw_pointelligence_resolutions is None:
+                self.pvconv_pointelligence_resolutions = DEFAULT_POINTELLIGENCE_RESOLUTIONS
+            else:
+                self.pvconv_pointelligence_resolutions = parse_resolution_set(raw_pointelligence_resolutions)
+        else:
+            self.pvconv_pointelligence_resolutions = frozenset()
+        global_attention = bool(getattr(args, "attention", True))
+        pvconv_local_attention = getattr(args, "pvconv_local_attention", None)
+        if pvconv_local_attention is None:
+            if self.pvconv_backend == "pointelligence":
+                pvconv_local_attention = False
+                logging.getLogger(__name__).info(
+                    "Defaulting pvconv_local_attention=False for pointelligence backend"
+                )
+            else:
+                pvconv_local_attention = global_attention
+        elif self.pvconv_backend == "pointelligence" and pvconv_local_attention:
+            raise ValueError("pointelligence backend does not support PVConv local attention")
+        self.pvconv_local_attention = bool(pvconv_local_attention)
 
-        self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
-                            dropout=args.dropout, extra_feature_channels=0)
+        self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=global_attention,
+                            dropout=args.dropout, extra_feature_channels=0,
+                            pvconv_backend=self.pvconv_backend,
+                            pvconv_local_attention=self.pvconv_local_attention,
+                            pvconv_pointelligence_resolutions=self.pvconv_pointelligence_resolutions)
+
+    def _to_state(self, data):
+        if isinstance(data, PointCloudState):
+            if data.grid_size is None:
+                raise ValueError("PointCloudState.grid_size must be set")
+            return data
+        return dense_to_point_cloud_state(data, grid_size=self.state_grid_size)
+
+    def _to_state_noise(self, noises, sample_sizes):
+        if noises is None:
+            return None
+        if noises.dim() == 3:
+            return dense_values_to_flat(noises, sample_sizes)
+        return noises
 
     def prior_kl(self, x0):
+        x0 = self._to_state(x0) if not isinstance(x0, PointCloudState) else x0
         return self.diffusion._prior_bpd(x0)
 
     def all_kl(self, x0, clip_denoised=True):
+        x0 = self._to_state(x0) if not isinstance(x0, PointCloudState) else x0
         total_bpd_b, vals_bt, prior_bpd_b, mse_bt =  self.diffusion.calc_bpd_loop(self._denoise, x0, clip_denoised)
 
         return {
@@ -420,6 +620,14 @@ class Model(nn.Module):
 
 
     def _denoise(self, data, t):
+        if isinstance(data, PointCloudState):
+            B, D = data.sample_sizes.numel(), data.coords.shape[1]
+            assert t.shape == torch.Size([B]) and t.dtype == torch.int64
+
+            out = self.model(data, t)
+
+            assert out.shape == torch.Size([data.coords.shape[0], D])
+            return out
         B, D,N= data.shape
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
@@ -430,29 +638,35 @@ class Model(nn.Module):
         return out
 
     def get_loss_iter(self, data, noises=None):
-        B, D, N = data.shape
-        t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.device)
+        if not isinstance(data, PointCloudState):
+            state = self._to_state(data)
+            return self.get_loss_iter(state, noises=self._to_state_noise(noises, state.sample_sizes))
+        if isinstance(data, PointCloudState):
+            B = data.sample_sizes.numel()
+            t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.coords.device)
 
-        if noises is not None:
-            noises[t!=0] = torch.randn((t!=0).sum(), *noises.shape[1:]).to(noises)
+            if noises is not None:
+                point_mask = expand_sample_tensor((t != 0)[:, None], data.sample_inds).squeeze(1).to(dtype=torch.bool)
+                noises[point_mask] = torch.randn(int(point_mask.sum().item()), *noises.shape[1:]).to(noises)
 
-        losses = self.diffusion.p_losses(
-            denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
-        assert losses.shape == t.shape == torch.Size([B])
-        return losses
-
+            losses = self.diffusion.p_losses(
+                denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
+            assert losses.shape == t.shape == torch.Size([B])
+            return losses
     def gen_samples(self, shape, device, noise_fn=torch.randn,
                     clip_denoised=True,
                     keep_running=False):
         return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
                                             clip_denoised=clip_denoised,
-                                            keep_running=keep_running)
+                                            keep_running=keep_running,
+                                            state_grid_size=self.state_grid_size)
 
     def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
                     clip_denoised=True,keep_running=False):
         return self.diffusion.p_sample_loop_trajectory(self._denoise, shape=shape, device=device, noise_fn=noise_fn, freq=freq,
                                                        clip_denoised=clip_denoised,
-                                                       keep_running=keep_running)
+                                                       keep_running=keep_running,
+                                                       state_grid_size=self.state_grid_size)
 
     def train(self):
         self.model.train()
@@ -487,6 +701,57 @@ def get_betas(schedule_type, b_start, b_end, time_num):
     return betas
 
 
+def collate_generation_train_samples(samples, *, state_grid_size):
+    if state_grid_size is None:
+        raise ValueError("state_grid_size must be provided for generation train collation")
+    if len(samples) == 0:
+        raise ValueError("samples must not be empty")
+
+    batch = {}
+    points_list = [sample["train_points"] for sample in samples]
+    for key in samples[0]:
+        if key == "train_points":
+            continue
+        values = [sample[key] for sample in samples]
+        if isinstance(values[0], str):
+            batch[key] = list(values)
+        else:
+            batch[key] = default_collate(values)
+
+    batch["state"] = point_cloud_state_from_points_list(points_list, grid_size=state_grid_size)
+    return batch
+
+
+def move_generation_batch_to_device(batch, device):
+    if isinstance(batch, PointCloudState):
+        return batch.to(device=device, non_blocking=True)
+    if torch.is_tensor(batch):
+        return batch.to(device=device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {key: move_generation_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, tuple):
+        return tuple(move_generation_batch_to_device(value, device) for value in batch)
+    if isinstance(batch, list):
+        if batch and isinstance(batch[0], str):
+            return list(batch)
+        return [move_generation_batch_to_device(value, device) for value in batch]
+    return batch
+
+
+def gather_generation_noise(noise_bank, idx, sample_sizes, device):
+    idx = idx.to(device=noise_bank.device, dtype=torch.long)
+    dense_noise = noise_bank.index_select(0, idx)
+    if dense_noise.shape[1] < int(sample_sizes.max().item()):
+        raise ValueError("noise bank does not have enough points for the requested sample_sizes")
+    dense_noise = dense_noise.to(device=device, non_blocking=True).transpose(1, 2).contiguous()
+    return dense_values_to_flat(dense_noise, sample_sizes)
+
+
+def destroy_process_group_if_initialized():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def get_dataset(dataroot, npoints,category):
     tr_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
         categories=[category], split='train',
@@ -510,6 +775,10 @@ def get_dataset(dataroot, npoints,category):
 
 
 def get_dataloader(opt, train_dataset, test_dataset=None):
+    collate_fn = functools.partial(
+        collate_generation_train_samples,
+        state_grid_size=opt.state_grid_size,
+    )
 
     if opt.distribution_type == 'multi':
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -530,11 +799,13 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
         test_sampler = None
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=train_sampler,
-                                                   shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
+                                                   shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True,
+                                                   collate_fn=collate_fn)
 
     if test_dataset is not None:
-        test_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=test_sampler,
-                                                   shuffle=False, num_workers=int(opt.workers), drop_last=False)
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.bs,sampler=test_sampler,
+                                                   shuffle=False, num_workers=int(opt.workers), drop_last=False,
+                                                   collate_fn=collate_fn)
     else:
         test_dataloader = None
 
@@ -632,22 +903,20 @@ def train(gpu, opt, output_dir, noises_init):
 
         lr_scheduler.step(epoch)
 
-        for i, data in enumerate(dataloader):
-            x = data['train_points'].transpose(1,2)
-            noises_batch = noises_init[data['idx']].transpose(1,2)
+        for i, batch in enumerate(dataloader):
 
             '''
             train diffusion
             '''
 
             if opt.distribution_type == 'multi' or (opt.distribution_type is None and gpu is not None):
-                x = x.cuda(gpu)
-                noises_batch = noises_batch.cuda(gpu)
+                batch = move_generation_batch_to_device(batch, torch.device("cuda", gpu))
             elif opt.distribution_type == 'single':
-                x = x.cuda()
-                noises_batch = noises_batch.cuda()
+                batch = move_generation_batch_to_device(batch, torch.device("cuda"))
 
-            loss = model.get_loss_iter(x, noises_batch).mean()
+            x_state = batch['state']
+            noises_state = gather_generation_noise(noises_init, batch['idx'], x_state.sample_sizes, x_state.coords.device)
+            loss = model.get_loss_iter(x_state, noises_state).mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -672,8 +941,8 @@ def train(gpu, opt, output_dir, noises_init):
 
             logger.info('Diagnosis:')
 
-            x_range = [x.min().item(), x.max().item()]
-            kl_stats = model.all_kl(x)
+            x_range = [x_state.coords.min().item(), x_state.coords.max().item()]
+            kl_stats = model.all_kl(x_state)
             logger.info('      [{:>3d}/{:>3d}]    '
                          'x_range: [{:>10.4f}, {:>10.4f}],   '
                          'total_bpd_b: {:>10.4f},    '
@@ -694,9 +963,10 @@ def train(gpu, opt, output_dir, noises_init):
 
             model.eval()
             with torch.no_grad():
+                x_dense = point_cloud_state_to_dense(x_state.coords, x_state.sample_sizes)
 
-                x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, clip_denoised=False)
-                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, freq=40, clip_denoised=False)
+                x_gen_eval = model.gen_samples(new_x_chain(x_dense, 25).shape, x_state.coords.device, clip_denoised=False)
+                x_gen_list = model.gen_sample_traj(new_x_chain(x_dense, 1).shape, x_state.coords.device, freq=40, clip_denoised=False)
                 x_gen_all = torch.cat(x_gen_list, dim=0)
 
                 gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
@@ -719,7 +989,7 @@ def train(gpu, opt, output_dir, noises_init):
                                        None,
                                        None)
 
-            visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x.transpose(1, 2), None,
+            visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x_dense.transpose(1, 2), None,
                                        None,
                                        None)
 
@@ -753,7 +1023,7 @@ def train(gpu, opt, output_dir, noises_init):
                 model.load_state_dict(
                     torch.load('%s/epoch_%d.pth' % (output_dir, epoch), map_location=map_location)['model_state'])
 
-    dist.destroy_process_group()
+    destroy_process_group_if_initialized()
 
 def main():
     opt = parse_args()
@@ -802,9 +1072,13 @@ def parse_args():
     parser.add_argument('--time_num', default=1000)
 
     #params
-    parser.add_argument('--attention', default=True)
+    parser.add_argument('--attention', type=str2bool, default=True)
     parser.add_argument('--dropout', default=0.1)
     parser.add_argument('--embed_dim', type=int, default=64)
+    parser.add_argument('--state_grid_size', type=float, default=None)
+    parser.add_argument('--pvconv_backend', type=str, default='voxel', choices=['voxel', 'pointelligence'])
+    parser.add_argument('--pvconv_local_attention', type=str2bool, default=None)
+    parser.add_argument('--pvconv_pointelligence_resolutions', type=parse_resolution_set, default=DEFAULT_POINTELLIGENCE_RESOLUTIONS)
     parser.add_argument('--loss_type', default='mse')
     parser.add_argument('--model_mean_type', default='eps')
     parser.add_argument('--model_var_type', default='fixedsmall')
@@ -836,10 +1110,10 @@ def parse_args():
                         help='GPU id to use. None means using all available GPUs.')
 
     '''eval'''
-    parser.add_argument('--saveIter', default=100, help='unit: epoch')
-    parser.add_argument('--diagIter', default=50, help='unit: epoch')
-    parser.add_argument('--vizIter', default=50, help='unit: epoch')
-    parser.add_argument('--print_freq', default=50, help='unit: iter')
+    parser.add_argument('--saveIter', type=int, default=100, help='unit: epoch')
+    parser.add_argument('--diagIter', type=int, default=50, help='unit: epoch')
+    parser.add_argument('--vizIter', type=int, default=50, help='unit: epoch')
+    parser.add_argument('--print_freq', type=int, default=50, help='unit: iter')
 
     parser.add_argument('--manualSeed', default=42, type=int, help='random seed')
 

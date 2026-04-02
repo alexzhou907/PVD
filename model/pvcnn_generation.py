@@ -3,7 +3,25 @@ import functools
 import torch.nn as nn
 import torch
 import numpy as np
-from modules import SharedMLP, PVConv, PointNetSAModule, PointNetAModule, PointNetFPModule, Attention, Swish
+from modules import (
+    Attention,
+    PointelligencePVConv,
+    PointNetAModule,
+    PointNetFPModule,
+    PointNetSAModule,
+    PVConv,
+    SharedMLP,
+    Swish,
+    clear_pointelligence_forward_cache,
+)
+from modules.ragged_dense_shims import (
+    sample_features_to_dense,
+    split_state_to_sample_lists,
+    state_has_uniform_sample_sizes,
+)
+from point_cloud_state import PointCloudState, dense_to_point_cloud_state, expand_sample_tensor, point_cloud_state_to_dense
+
+DEFAULT_POINTELLIGENCE_RESOLUTIONS = frozenset({8, 16, 32})
 
 
 def _linear_gn_relu(in_channels, out_channels):
@@ -43,21 +61,77 @@ def create_mlp_components(in_channels, out_channels, classifier=False, dim=2, wi
     return layers, out_channels[-1] if classifier else int(r * out_channels[-1])
 
 
+def _select_pvconv_backend(pvconv_backend):
+    if pvconv_backend == "voxel":
+        return PVConv
+    if pvconv_backend == "pointelligence":
+        return PointelligencePVConv
+    raise ValueError(f"Unknown pvconv_backend: {pvconv_backend}")
+
+
+def _resolve_pointelligence_resolutions(pvconv_backend, pvconv_pointelligence_resolutions):
+    if pvconv_backend != "pointelligence":
+        return frozenset()
+    if pvconv_pointelligence_resolutions is None:
+        return DEFAULT_POINTELLIGENCE_RESOLUTIONS
+    return frozenset(int(resolution) for resolution in pvconv_pointelligence_resolutions)
+
+
+def _select_pvconv_class_for_resolution(
+    pvconv_backend,
+    voxel_resolution,
+    pvconv_pointelligence_resolutions,
+):
+    if voxel_resolution is None:
+        return SharedMLP
+    if (
+        pvconv_backend == "pointelligence"
+        and int(voxel_resolution) in pvconv_pointelligence_resolutions
+    ):
+        return PointelligencePVConv
+    return PVConv
+
+
+def _resolve_pvconv_local_attention(pvconv_backend, pvconv_local_attention):
+    if pvconv_backend == "pointelligence" and pvconv_local_attention:
+        raise ValueError("pointelligence backend does not support PVConv local attention")
+    if pvconv_local_attention is None:
+        return pvconv_backend == "voxel"
+    return bool(pvconv_local_attention)
+
+
 def create_pointnet_components(blocks, in_channels, embed_dim, with_se=False, normalize=True, eps=0,
-                               width_multiplier=1, voxel_resolution_multiplier=1):
+                               width_multiplier=1, voxel_resolution_multiplier=1, pvconv_backend="voxel",
+                               pvconv_local_attention=None, pvconv_pointelligence_resolutions=None):
     r, vr = width_multiplier, voxel_resolution_multiplier
+    use_local_attention = _resolve_pvconv_local_attention(pvconv_backend, pvconv_local_attention)
+    pointelligence_resolutions = _resolve_pointelligence_resolutions(
+        pvconv_backend, pvconv_pointelligence_resolutions
+    )
 
     layers, concat_channels = [], 0
     c = 0
     for k, (out_channels, num_blocks, voxel_resolution) in enumerate(blocks):
         out_channels = int(r * out_channels)
         for p in range(num_blocks):
-            attention = k % 2 == 0 and k > 0 and p == 0
+            attention = use_local_attention and k % 2 == 0 and k > 0 and p == 0
+            pvconv_cls = _select_pvconv_class_for_resolution(
+                pvconv_backend,
+                voxel_resolution,
+                pointelligence_resolutions,
+            )
             if voxel_resolution is None:
                 block = SharedMLP
             else:
-                block = functools.partial(PVConv, kernel_size=3, resolution=int(vr * voxel_resolution), attention=attention,
-                                          with_se=with_se, normalize=normalize, eps=eps)
+                block = functools.partial(
+                    pvconv_cls,
+                    kernel_size=3,
+                    resolution=int(vr * voxel_resolution),
+                    attention=attention,
+                    with_se=with_se,
+                    normalize=normalize,
+                    eps=eps,
+                )
 
             if c == 0:
                 layers.append(block(in_channels, out_channels))
@@ -71,9 +145,14 @@ def create_pointnet_components(blocks, in_channels, embed_dim, with_se=False, no
 
 def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=64, use_att=False,
                                    dropout=0.1, with_se=False, normalize=True, eps=0,
-                                   width_multiplier=1, voxel_resolution_multiplier=1):
+                                   width_multiplier=1, voxel_resolution_multiplier=1, pvconv_backend="voxel",
+                                   pvconv_local_attention=None, pvconv_pointelligence_resolutions=None):
     r, vr = width_multiplier, voxel_resolution_multiplier
     in_channels = extra_feature_channels + 3
+    use_local_attention = _resolve_pvconv_local_attention(pvconv_backend, pvconv_local_attention)
+    pointelligence_resolutions = _resolve_pointelligence_resolutions(
+        pvconv_backend, pvconv_pointelligence_resolutions
+    )
 
     sa_layers, sa_in_channels = [], []
     c = 0
@@ -86,14 +165,26 @@ def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=
             out_channels, num_blocks, voxel_resolution = conv_configs
             out_channels = int(r * out_channels)
             for p in range(num_blocks):
-                attention = (c+1) % 2 == 0 and use_att and p == 0
+                attention = (c+1) % 2 == 0 and use_att and p == 0 and use_local_attention
+                pvconv_cls = _select_pvconv_class_for_resolution(
+                    pvconv_backend,
+                    voxel_resolution,
+                    pointelligence_resolutions,
+                )
                 if voxel_resolution is None:
                     block = SharedMLP
                 else:
-                    block = functools.partial(PVConv, kernel_size=3, resolution=int(vr * voxel_resolution), attention=attention,
-                                              dropout=dropout,
-                                              with_se=with_se, with_se_relu=True,
-                                              normalize=normalize, eps=eps)
+                    block = functools.partial(
+                        pvconv_cls,
+                        kernel_size=3,
+                        resolution=int(vr * voxel_resolution),
+                        attention=attention,
+                        dropout=dropout,
+                        with_se=with_se,
+                        with_se_relu=True,
+                        normalize=normalize,
+                        eps=eps,
+                    )
 
                 if c == 0:
                     sa_blocks.append(block(in_channels, out_channels))
@@ -130,15 +221,20 @@ def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=
 def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_dim=64, use_att=False,
                                 dropout=0.1,
                                 with_se=False, normalize=True, eps=0,
-                                width_multiplier=1, voxel_resolution_multiplier=1):
+                                width_multiplier=1, voxel_resolution_multiplier=1, pvconv_backend="voxel",
+                                pvconv_local_attention=None, pvconv_pointelligence_resolutions=None):
     r, vr = width_multiplier, voxel_resolution_multiplier
+    use_local_attention = _resolve_pvconv_local_attention(pvconv_backend, pvconv_local_attention)
+    pointelligence_resolutions = _resolve_pointelligence_resolutions(
+        pvconv_backend, pvconv_pointelligence_resolutions
+    )
 
+    total_fp_stages = len(fp_blocks)
     fp_layers = []
-    c = 0
     for fp_idx, (fp_configs, conv_configs) in enumerate(fp_blocks):
-        fp_blocks = []
+        stage_layers = []
         out_channels = tuple(int(r * oc) for oc in fp_configs)
-        fp_blocks.append(
+        stage_layers.append(
             PointNetFPModule(in_channels=in_channels + sa_in_channels[-1 - fp_idx] + embed_dim, out_channels=out_channels)
         )
         in_channels = out_channels[-1]
@@ -147,23 +243,39 @@ def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_di
             out_channels, num_blocks, voxel_resolution = conv_configs
             out_channels = int(r * out_channels)
             for p in range(num_blocks):
-                attention = (c+1) % 2 == 0 and c < len(fp_blocks) - 1 and use_att and p == 0
+                attention = (
+                    (fp_idx + 1) % 2 == 0
+                    and fp_idx < total_fp_stages - 1
+                    and use_att
+                    and p == 0
+                    and use_local_attention
+                )
+                pvconv_cls = _select_pvconv_class_for_resolution(
+                    pvconv_backend,
+                    voxel_resolution,
+                    pointelligence_resolutions,
+                )
                 if voxel_resolution is None:
                     block = SharedMLP
                 else:
-                    block = functools.partial(PVConv, kernel_size=3, resolution=int(vr * voxel_resolution), attention=attention,
-                                              dropout=dropout,
-                                              with_se=with_se, with_se_relu=True,
-                                              normalize=normalize, eps=eps)
+                    block = functools.partial(
+                        pvconv_cls,
+                        kernel_size=3,
+                        resolution=int(vr * voxel_resolution),
+                        attention=attention,
+                        dropout=dropout,
+                        with_se=with_se,
+                        with_se_relu=True,
+                        normalize=normalize,
+                        eps=eps,
+                    )
 
-                fp_blocks.append(block(in_channels, out_channels))
+                stage_layers.append(block(in_channels, out_channels))
                 in_channels = out_channels
-        if len(fp_blocks) == 1:
-            fp_layers.append(fp_blocks[0])
+        if len(stage_layers) == 1:
+            fp_layers.append(stage_layers[0])
         else:
-            fp_layers.append(nn.Sequential(*fp_blocks))
-
-        c += 1
+            fp_layers.append(nn.Sequential(*stage_layers))
 
     return fp_layers, in_channels
 
@@ -172,16 +284,26 @@ def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_di
 class PVCNN2Base(nn.Module):
 
     def __init__(self, num_classes, embed_dim, use_att, dropout=0.1,
-                 extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1):
+                 extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1,
+                 pvconv_backend="voxel", pvconv_local_attention=None,
+                 pvconv_pointelligence_resolutions=None):
         super().__init__()
         assert extra_feature_channels >= 0
         self.embed_dim = embed_dim
         self.in_channels = extra_feature_channels + 3
+        self.pvconv_backend = pvconv_backend
+        self.pvconv_local_attention = _resolve_pvconv_local_attention(pvconv_backend, pvconv_local_attention)
+        self.pvconv_pointelligence_resolutions = _resolve_pointelligence_resolutions(
+            pvconv_backend, pvconv_pointelligence_resolutions
+        )
 
         sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
             sa_blocks=self.sa_blocks, extra_feature_channels=extra_feature_channels, with_se=True, embed_dim=embed_dim,
             use_att=use_att, dropout=dropout,
-            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
+            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier,
+            pvconv_backend=pvconv_backend,
+            pvconv_local_attention=self.pvconv_local_attention,
+            pvconv_pointelligence_resolutions=self.pvconv_pointelligence_resolutions,
         )
         self.sa_layers = nn.ModuleList(sa_layers)
 
@@ -192,7 +314,10 @@ class PVCNN2Base(nn.Module):
         fp_layers, channels_fp_features = create_pointnet2_fp_modules(
             fp_blocks=self.fp_blocks, in_channels=channels_sa_features, sa_in_channels=sa_in_channels, with_se=True, embed_dim=embed_dim,
             use_att=use_att, dropout=dropout,
-            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
+            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier,
+            pvconv_backend=pvconv_backend,
+            pvconv_local_attention=self.pvconv_local_attention,
+            pvconv_pointelligence_resolutions=self.pvconv_pointelligence_resolutions,
         )
         self.fp_layers = nn.ModuleList(fp_layers)
 
@@ -222,8 +347,12 @@ class PVCNN2Base(nn.Module):
         assert emb.shape == torch.Size([timesteps.shape[0], self.embed_dim])
         return emb
 
-    def forward(self, inputs, t):
+    def _apply_classifier(self, features):
+        if features.dim() == 2:
+            return self.classifier(features.unsqueeze(-1)).squeeze(-1)
+        return self.classifier(features)
 
+    def _forward_dense(self, inputs, t):
         temb =  self.embedf(self.get_timestep_embedding(t, inputs.device))[:,:,None].expand(-1,-1,inputs.shape[-1])
 
         # inputs : [B, in_channels + S, N]
@@ -242,6 +371,56 @@ class PVCNN2Base(nn.Module):
         for fp_idx, fp_blocks  in enumerate(self.fp_layers):
             features, coords, temb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,temb],dim=1), in_features_list[-1-fp_idx], temb))
 
-        return self.classifier(features)
+        return self._apply_classifier(features)
 
+    def _forward_state(self, inputs, t):
+        temb_sample = self.embedf(self.get_timestep_embedding(t, inputs.coords.device))
 
+        state = inputs
+        state_list, in_features_list = [], []
+        for i, sa_blocks in enumerate(self.sa_layers):
+            in_features_list.append(state.features)
+            state_list.append(state)
+            if i == 0:
+                state, temb_sample = sa_blocks((state, temb_sample))
+            else:
+                state = state.replace_features(
+                    torch.cat([state.features, expand_sample_tensor(temb_sample, state.sample_inds)], dim=1)
+                )
+                state, temb_sample = sa_blocks((state, temb_sample))
+
+        in_features_list[0] = inputs.features[:, 3:].contiguous()
+        if self.global_att is not None:
+            if state_has_uniform_sample_sizes(state):
+                dense_coords = point_cloud_state_to_dense(state.coords, state.sample_sizes)
+                dense_features = point_cloud_state_to_dense(state.features, state.sample_sizes)
+                state = dense_to_point_cloud_state(
+                    dense_coords,
+                    features=self.global_att(dense_features),
+                    grid_size=state.grid_size,
+                )
+            else:
+                _, features_list = split_state_to_sample_lists(state)
+                attended_features = []
+                for features_i in features_list:
+                    dense_features_i = sample_features_to_dense(features_i)
+                    attended_features.append(
+                        self.global_att(dense_features_i).squeeze(0).transpose(0, 1).contiguous()
+                    )
+                state = state.replace_features(torch.cat(attended_features, dim=0))
+        for fp_idx, fp_blocks in enumerate(self.fp_layers):
+            centers_features = torch.cat(
+                [state.features, expand_sample_tensor(temb_sample, state.sample_inds)],
+                dim=1,
+            )
+            state, temb_sample = fp_blocks(
+                (state_list[-1 - fp_idx], state, centers_features, in_features_list[-1 - fp_idx], temb_sample)
+            )
+
+        return self._apply_classifier(state.features)
+
+    def forward(self, inputs, t):
+        clear_pointelligence_forward_cache()
+        if isinstance(inputs, PointCloudState):
+            return self._forward_state(inputs, t)
+        return self._forward_dense(inputs, t)

@@ -3,7 +3,19 @@ import torch
 import modules.functional as F
 from modules.voxelization import Voxelization
 from modules.shared_mlp import SharedMLP
+from modules.ragged_dense_shims import (
+    replace_state_features_from_dense,
+    sample_features_to_dense,
+    sample_points_to_dense,
+    sample_temporal_embedding_to_dense,
+    sample_tensor_to_dense,
+    split_state_to_sample_lists,
+    state_has_uniform_sample_sizes,
+    state_coords_to_dense,
+    state_features_to_dense,
+)
 from modules.se import SE3d
+from point_cloud_state import PointCloudState
 
 __all__ = ['PVConv', 'Attention', 'Swish', 'PVConvReLU']
 
@@ -87,13 +99,34 @@ class PVConv(nn.Module):
         self.voxel_layers = nn.Sequential(*voxel_layers)
         self.point_features = SharedMLP(in_channels, out_channels)
 
-    def forward(self, inputs):
-        features, coords, temb = inputs
+    def _forward_dense(self, features, coords, temb):
         voxel_features, voxel_coords = self.voxelization(features, coords)
         voxel_features = self.voxel_layers(voxel_features)
         voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb
+
+    def forward(self, inputs):
+        if len(inputs) == 2 and isinstance(inputs[0], PointCloudState):
+            state, temb_sample = inputs
+            if not state_has_uniform_sample_sizes(state):
+                coords_list, features_list = split_state_to_sample_lists(state)
+                features_out_list = []
+                for coords_i, features_i, temb_i in zip(coords_list, features_list, temb_sample):
+                    dense_out, _, _ = self._forward_dense(
+                        sample_features_to_dense(features_i),
+                        sample_points_to_dense(coords_i),
+                        sample_temporal_embedding_to_dense(temb_i, coords_i.shape[0]),
+                    )
+                    features_out_list.append(dense_out.squeeze(0).transpose(0, 1).contiguous())
+                return state.replace_features(torch.cat(features_out_list, dim=0)), temb_sample
+            dense_features = state_features_to_dense(state)
+            dense_coords = state_coords_to_dense(state)
+            dense_temb = sample_tensor_to_dense(temb_sample, state)
+            dense_out, _, _ = self._forward_dense(dense_features, dense_coords, dense_temb)
+            return replace_state_features_from_dense(state, dense_out), temb_sample
+        features, coords, temb = inputs
+        return self._forward_dense(features, coords, temb)
 
 
 
@@ -123,10 +156,31 @@ class PVConvReLU(nn.Module):
         self.voxel_layers = nn.Sequential(*voxel_layers)
         self.point_features = SharedMLP(in_channels, out_channels)
 
-    def forward(self, inputs):
-        features, coords, temb = inputs
+    def _forward_dense(self, features, coords, temb):
         voxel_features, voxel_coords = self.voxelization(features, coords)
         voxel_features = self.voxel_layers(voxel_features)
         voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb
+
+    def forward(self, inputs):
+        if len(inputs) == 2 and isinstance(inputs[0], PointCloudState):
+            state, temb_sample = inputs
+            if not state_has_uniform_sample_sizes(state):
+                coords_list, features_list = split_state_to_sample_lists(state)
+                features_out_list = []
+                for coords_i, features_i, temb_i in zip(coords_list, features_list, temb_sample):
+                    dense_out, _, _ = self._forward_dense(
+                        sample_features_to_dense(features_i),
+                        sample_points_to_dense(coords_i),
+                        sample_temporal_embedding_to_dense(temb_i, coords_i.shape[0]),
+                    )
+                    features_out_list.append(dense_out.squeeze(0).transpose(0, 1).contiguous())
+                return state.replace_features(torch.cat(features_out_list, dim=0)), temb_sample
+            dense_features = state_features_to_dense(state)
+            dense_coords = state_coords_to_dense(state)
+            dense_temb = sample_tensor_to_dense(temb_sample, state)
+            dense_out, _, _ = self._forward_dense(dense_features, dense_coords, dense_temb)
+            return replace_state_features_from_dense(state, dense_out), temb_sample
+        features, coords, temb = inputs
+        return self._forward_dense(features, coords, temb)
